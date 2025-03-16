@@ -99,10 +99,7 @@ func (f *sftpFile) Readdir(count int) ([]os.FileInfo, error) {
 	if f.readdirPos >= len(f.readdirCache) {
 		return nil, nil
 	}
-	end := f.readdirPos + count
-	if end > len(f.readdirCache) {
-		end = len(f.readdirCache)
-	}
+	end := min(f.readdirPos+count, len(f.readdirCache))
 	entries := f.readdirCache[f.readdirPos:end]
 	f.readdirPos = end
 	return entries, nil
