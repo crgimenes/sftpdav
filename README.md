@@ -18,7 +18,7 @@ A **WebDAV** server that exposes a remote SFTP directory as a local mount point.
 
 ## Requirements
 
-- **Go 1.23 or later**.
+- **Go 1.24 or later**.
 - A valid SSH configuration (e.g., `~/.ssh/config`) or at least an SSH key pair.
 - A known_hosts file configured for the remote server (`~/.ssh/known_hosts`).
 
