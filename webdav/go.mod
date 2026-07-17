@@ -1,5 +1,5 @@
 module webdav
 
-go 1.24.0
+go 1.26.5
 
-require golang.org/x/net v0.48.0
+require golang.org/x/net v0.57.0
