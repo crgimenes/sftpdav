@@ -1,6 +1,6 @@
 module github.com/crgimenes/sftpdav
 
-go 1.26.5
+go 1.27
 
 require (
 	github.com/kevinburke/ssh_config v1.6.0
