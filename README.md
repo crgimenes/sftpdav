@@ -7,19 +7,20 @@ A **WebDAV** server that exposes a remote SFTP directory as a local mount point.
 - **SFTP client**: Connects to a remote server via SSH and uses [SFTP](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02).
 - **WebDAV server**: Serves remote files over WebDAV on a local port.
 - **No extra ports on remote**: Only SSH port `22` is required on the remote machine.
+- **Survives sleep and network changes**: a keep-alive notices a dead SSH link within about 25 seconds, and the next request dials again.
 - **Mountable on Linux/macOS**: Use standard WebDAV mounting tools (e.g., `mount -t davfs` on Linux, `mount_webdav` on macOS).
 
 ## How It Works
 
-1. **SSH** connection is established using the `~/.ssh/config` file (or defaults).
+1. **SSH** connection is established using the `~/.ssh/config` file (or defaults), authenticating through `ssh-agent` or the host's `IdentityFile`.
 2. **SFTP** is used to interact with the remote file system.
-3. **WebDAV** is served locally via a built-in HTTP server.
+3. **WebDAV** is served on `127.0.0.1` only: the share has no authentication of its own.
 4. Mount the local WebDAV server to access the remote files.
 
 ## Requirements
 
-- **Go 1.24 or later**.
-- A valid SSH configuration (e.g., `~/.ssh/config`) or at least an SSH key pair.
+- **Go 1.27 or later**.
+- A running `ssh-agent` holding your key, or an `IdentityFile` for the host in `~/.ssh/config` (an unencrypted key; a passphrase-protected one must go through the agent).
 - A known_hosts file configured for the remote server (`~/.ssh/known_hosts`).
 
 ## Installation
@@ -44,11 +45,11 @@ This will produce the binary `sftpdav`.
 
    - **Linux**:
      ```bash
-     sudo mount -t davfs http://localhost:8811 /mnt/sftp
+     sudo mount -t davfs http://127.0.0.1:8811 /mnt/sftp
      ```
    - **macOS**:
      ```bash
-     sudo mount_webdav http://localhost:8811 /mnt/sftp
+     sudo mount_webdav http://127.0.0.1:8811 /mnt/sftp
      ```
 
 3. **Unmount**:
@@ -69,11 +70,11 @@ dot_clean /path/to/your/mounted/folder
 A simpler version of the code resides in the `webdav/` directory. It serves a local folder over WebDAV and must run on the same machine that holds the files:
 
 ```bash
-go build -o webdav ./webdav
-./webdav -port 8811 -dir /local/folder
+go -C webdav build
+./webdav/webdav -port 8811 -dir /local/folder
 ```
 
-Then use a ssh tunel to access the WebDAV server:
+Then use an SSH tunnel to access the WebDAV server:
 
 ```bash
 ssh -N -L "8811:localhost:8811" user@remote

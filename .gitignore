@@ -26,3 +26,13 @@ go.work.sum
 
 # macOS extended attributes
 ._*
+
+# build output
+/sftpdav
+/webdav/webdav
+dist/
+
+# shared link to ../scripts/release.sh, never committed
+release.sh
+
+.DS_Store

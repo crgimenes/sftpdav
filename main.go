@@ -2,76 +2,101 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
-	"strings"
 	"time"
 
-	"github.com/kevinburke/ssh_config"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/net/webdav"
 )
 
+const usageText = `usage: sftpdav -host alias [-remoteDir dir] [-port port]
+
+Serves a remote directory, reached over SSH/SFTP, as WebDAV on 127.0.0.1.
+The host is resolved through ~/.ssh/config; authentication uses ssh-agent,
+or the host's IdentityFile; the host key must be in ~/.ssh/known_hosts.
+
+flags:
+`
+
+const usageExample = `
+example:
+  sftpdav -host myremote -remoteDir /srv/data
+  mount_webdav http://127.0.0.1:8811 /Volumes/data
+`
+
 type SFTPFileSystem struct {
-	client    *sftp.Client
+	remote    *remote
 	remoteDir string
 }
 
+// resolve keeps name inside remoteDir: the webdav handler passes the request
+// path through raw, so "/../x" would otherwise escape it.
+func (fsys *SFTPFileSystem) resolve(name string) string {
+	return path.Join(fsys.remoteDir, path.Clean("/"+name))
+}
+
 func (fsys *SFTPFileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	remotePath := path.Join(fsys.remoteDir, name)
-	return fsys.client.MkdirAll(remotePath)
+	c, err := fsys.remote.sftp(ctx)
+	if err != nil {
+		return err
+	}
+	return c.Mkdir(fsys.resolve(name))
 }
 
 func (fsys *SFTPFileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
-	remotePath := path.Join(fsys.remoteDir, name)
-	file, err := fsys.client.OpenFile(remotePath, flag)
+	c, err := fsys.remote.sftp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	remotePath := fsys.resolve(name)
+	file, err := c.OpenFile(remotePath, flag)
 	if err != nil {
 		return nil, err
 	}
 	return &sftpFile{
 		File:       file,
-		client:     fsys.client,
+		client:     c,
 		remotePath: remotePath,
 	}, nil
 }
 
 func (fsys *SFTPFileSystem) RemoveAll(ctx context.Context, name string) error {
-	remotePath := path.Join(fsys.remoteDir, name)
-	info, err := fsys.client.Stat(remotePath)
+	if path.Clean("/"+name) == "/" {
+		// same rule as webdav.Dir: a DELETE on the root would wipe remoteDir
+		return os.ErrInvalid
+	}
+	c, err := fsys.remote.sftp(ctx)
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
-		return fsys.client.Remove(remotePath)
-	}
-	entries, err := fsys.client.ReadDir(remotePath)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		err = fsys.RemoveAll(ctx, path.Join(name, entry.Name()))
-		if err != nil {
-			return err
-		}
-	}
-	return fsys.client.RemoveDirectory(remotePath)
+	// the client's RemoveAll uses Lstat: a symlink to a directory is unlinked,
+	// never followed out of remoteDir
+	return c.RemoveAll(fsys.resolve(name))
 }
 
 func (fsys *SFTPFileSystem) Rename(ctx context.Context, oldName, newName string) error {
-	oldPath := path.Join(fsys.remoteDir, oldName)
-	newPath := path.Join(fsys.remoteDir, newName)
-	return fsys.client.Rename(oldPath, newPath)
+	c, err := fsys.remote.sftp(ctx)
+	if err != nil {
+		return err
+	}
+	return c.Rename(fsys.resolve(oldName), fsys.resolve(newName))
 }
 
 func (fsys *SFTPFileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	remotePath := path.Join(fsys.remoteDir, name)
-	return fsys.client.Stat(remotePath)
+	c, err := fsys.remote.sftp(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.Stat(fsys.resolve(name))
 }
 
 type sftpFile struct {
@@ -105,119 +130,77 @@ func (f *sftpFile) Readdir(count int) ([]os.FileInfo, error) {
 	return entries, nil
 }
 
-func (f *sftpFile) Stat() (os.FileInfo, error) {
-	return f.File.Stat()
-}
+func run(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("sftpdav", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	host := fs.String("host", "", "SSH host `alias` from ~/.ssh/config, or a hostname")
+	remoteDir := fs.String("remoteDir", ".", "remote `directory` to expose")
+	port := fs.String("port", "8811", "local `port` for the WebDAV server")
+	usage := func(w io.Writer) {
+		_, _ = fmt.Fprint(w, usageText)
+		fs.SetOutput(w)
+		fs.PrintDefaults()
+		fs.SetOutput(io.Discard)
+		_, _ = fmt.Fprint(w, usageExample)
+	}
 
-func loadPrivateKey(keyPath string) (ssh.Signer, error) {
-	key, err := os.ReadFile(keyPath)
+	err := fs.Parse(args)
+	if errors.Is(err, flag.ErrHelp) {
+		usage(stdout)
+		return err
+	}
+	if err == nil && *host == "" {
+		err = errors.New("-host is required")
+	}
+	if err == nil && fs.NArg() > 0 {
+		err = fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
 	if err != nil {
-		return nil, err
-	}
-	return ssh.ParsePrivateKey(key)
-}
-
-func main() {
-	hostFlag := flag.String("host", "", "SSH host to connect to (as defined in ~/.ssh/config)")
-	remoteDirFlag := flag.String("remoteDir", ".", "Remote directory to expose via WebDAV")
-	localPortFlag := flag.String("port", "8811", "Local port for WebDAV server")
-	flag.Parse()
-
-	if *hostFlag == "" {
-		log.Fatal("host flag is required")
+		usage(os.Stderr)
+		return err
 	}
 
-	sshConfigPath := os.ExpandEnv("$HOME/.ssh/config")
-	file, err := os.Open(sshConfigPath)
+	r := &remote{dial: func(ctx context.Context) (*ssh.Client, error) {
+		sc, err := dialSSH(ctx, *host)
+		if err != nil {
+			return nil, fmt.Errorf("ssh %s: %w", *host, err)
+		}
+		return sc, nil
+	}}
+	// dial now, so a wrong host or key fails here and not on the first mount
+	_, err = r.sftp(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to open SSH config file: %v", err)
-	}
-	defer file.Close()
-	cfg, err := ssh_config.Decode(file)
-	if err != nil {
-		log.Fatalf("Failed to decode SSH config: %v", err)
-	}
-
-	user, _ := cfg.Get(*hostFlag, "User")
-	if user == "" {
-		user = os.Getenv("USER")
-	}
-	hostname, _ := cfg.Get(*hostFlag, "Hostname")
-	if hostname == "" {
-		hostname = *hostFlag
-	}
-	port, _ := cfg.Get(*hostFlag, "Port")
-	if port == "" {
-		port = "22"
-	}
-	identityFile, _ := cfg.Get(*hostFlag, "IdentityFile")
-	if identityFile == "" {
-		identityFile = os.ExpandEnv("$HOME/.ssh/id_rsa")
-	} else {
-		identityFile = os.ExpandEnv(identityFile)
-	}
-
-	log.Printf("identityFile: %s", identityFile)
-	if strings.HasPrefix(identityFile, "~/") {
-		identityFile = strings.Replace(identityFile, "~/", os.ExpandEnv("$HOME/"), 1)
-	}
-	log.Printf("identityFile: %s", identityFile)
-
-	signer, err := loadPrivateKey(identityFile)
-	if err != nil {
-		log.Fatalf("Failed to load private key: %v", err)
-	}
-
-	hostKeyCallback, err := knownhosts.New(os.ExpandEnv("$HOME/.ssh/known_hosts"))
-	if err != nil {
-		log.Fatal("could not create hostkeycallback function: ", err)
-	}
-
-	sshClientConfig := &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		//HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		HostKeyCallback: hostKeyCallback,
-	}
-
-	addr := fmt.Sprintf("%s:%s", hostname, port)
-	sshClient, err := ssh.Dial("tcp", addr, sshClientConfig)
-	if err != nil {
-		log.Fatalf("Failed to dial SSH: %v", err)
-	}
-	defer sshClient.Close()
-
-	sftpClient, err := sftp.NewClient(sshClient)
-	if err != nil {
-		log.Fatalf("Failed to create SFTP client: %v", err)
-	}
-	defer sftpClient.Close()
-
-	fsys := &SFTPFileSystem{
-		client:    sftpClient,
-		remoteDir: *remoteDirFlag,
+		return err
 	}
 
 	handler := &webdav.Handler{
-		Prefix:     "/",
-		FileSystem: fsys,
+		Prefix: "/",
+		FileSystem: &SFTPFileSystem{
+			remote:    r,
+			remoteDir: *remoteDir,
+		},
 		LockSystem: webdav.NewMemLS(),
 	}
 
-	log.Printf("Starting WebDAV server on :%s", *localPortFlag)
-	log.Printf("Accessing SSH server %s@%s:%s", user, hostname, port)
-
+	// Loopback only: the share has no authentication of its own.
+	addr := net.JoinHostPort("127.0.0.1", *port)
 	s := &http.Server{
-		Handler:        handler,
-		Addr:           ":" + *localPortFlag,
-		ReadTimeout:    15 * time.Second,
-		WriteTimeout:   15 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		Handler: handler,
+		Addr:    addr,
+		// no Read/WriteTimeout: they would cut a large transfer midway
+		ReadHeaderTimeout: 15 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	err = s.ListenAndServe()
+	log.Printf("serving %s:%s as WebDAV on http://%s", *host, *remoteDir, addr)
+	return s.ListenAndServe()
+}
+
+func main() {
+	err := run(os.Args[1:], os.Stdout)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
